@@ -1,57 +1,76 @@
 export async function onRequest(context) {
-    const {
-        request,
-        env,
-        params,
-    } = context;
+    const { request, env, params } = context;
 
     const url = new URL(request.url);
-    let fileUrl = 'https://telegra.ph/' + url.pathname + url.search
-    if (url.pathname.length > 39) { // Path length > 39 indicates file uploaded via Telegram Bot API
+    let fileUrl = 'https://telegra.ph' + url.pathname + url.search;
+
+    // Path length > 39 indicates file uploaded via Telegram Bot API
+    if (url.pathname.length > 39) {
         const formdata = new FormData();
         formdata.append("file_id", url.pathname);
 
-        const requestOptions = {
-            method: "POST",
-            body: formdata,
-            redirect: "follow"
-        };
         // /file/AgACAgEAAxkDAAMDZt1Gzs4W8dQPWiQJxO5YSH5X-gsAAt-sMRuWNelGOSaEM_9lHHgBAAMCAANtAAM2BA.png
-        //get the AgACAgEAAxkDAAMDZt1Gzs4W8dQPWiQJxO5YSH5X-gsAAt-sMRuWNelGOSaEM_9lHHgBAAMCAANtAAM2BA
-        console.log(url.pathname.split(".")[0].split("/")[2])
-        const filePath = await getFilePath(env, url.pathname.split(".")[0].split("/")[2]);
-        console.log(filePath)
-        fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
+        // get the AgACAgEAAxkDAAMDZt1Gzs4W8dQPWiQJxO5YSH5X-gsAAt-sMRuWNelGOSaEM_9lHHgBAAMCAANtAAM2BA
+        const fileId = url.pathname.split(".")[0].split("/")[2];
+        console.log("file_id:", fileId);
+
+        const filePath = await getFilePath(env, fileId);
+        console.log("file_path:", filePath);
+
+        if (filePath) {
+            fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
+        }
     }
 
+    // 先请求源文件
     const response = await fetch(fileUrl, {
         method: request.method,
         headers: request.headers,
         body: request.body,
     });
 
-    // If the response is OK, proceed with further checks
+    // 源站都挂了就没得救，原样返回错误
     if (!response.ok) return response;
 
-    // Log response details
     console.log(response.ok, response.status);
 
-    // Allow the admin page to directly view the image
-    const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
+    const isAdmin = request.headers.get("Referer")?.includes(`${url.origin}/admin`);
+
+    // ---------- 如果是 admin 页面：跳过 KV、白名单等逻辑，直接返回文件，但改成 inline 显示 ----------
     if (isAdmin) {
-        return response;
+        const adminBuffer = await response.arrayBuffer();
+        const adminType = response.headers.get("Content-Type") || "image/jpeg";
+
+        return new Response(adminBuffer, {
+            headers: {
+                "Content-Type": adminType,
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=31536000",
+                "Access-Control-Allow-Origin": "*",
+            },
+        });
     }
 
-    // Check if KV storage is available
+    // ---------- 如果没有 KV，直接返回图片，但改成 inline + 缓存 ----------
     if (!env.img_url) {
-        console.log("KV storage not available, returning image directly");
-        return response;  // Directly return image response, terminate execution
+        console.log("KV storage not available, returning image directly (inline)");
+
+        const buf = await response.arrayBuffer();
+        const ct = response.headers.get("Content-Type") || "image/jpeg";
+
+        return new Response(buf, {
+            headers: {
+                "Content-Type": ct,
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=31536000",
+                "Access-Control-Allow-Origin": "*",
+            },
+        });
     }
 
-    // The following code executes only if KV is available
+    // ---------- 有 KV 的情况：读取 / 初始化 metadata ----------
     let record = await env.img_url.getWithMetadata(params.id);
     if (!record || !record.metadata) {
-        // Initialize metadata if it doesn't exist
         console.log("Metadata not found, initializing...");
         record = {
             metadata: {
@@ -61,7 +80,7 @@ export async function onRequest(context) {
                 liked: false,
                 fileName: params.id,
                 fileSize: 0,
-            }
+            },
         };
         await env.img_url.put(params.id, "", { metadata: record.metadata });
     }
@@ -75,21 +94,34 @@ export async function onRequest(context) {
         fileSize: record.metadata.fileSize || 0,
     };
 
-    // Handle based on ListType and Label
+    // ---------- 白名单 / 黑名单 / 成人内容处理 ----------
     if (metadata.ListType === "White") {
-        return response;
+        // 白名单：直接放行，但我们还是改成 inline + 缓存
+        const whiteBuf = await response.arrayBuffer();
+        const whiteType = response.headers.get("Content-Type") || "image/jpeg";
+
+        return new Response(whiteBuf, {
+            headers: {
+                "Content-Type": whiteType,
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=31536000",
+                "Access-Control-Allow-Origin": "*",
+            },
+        });
     } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
-        const referer = request.headers.get('Referer');
-        const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
+        const referer = request.headers.get("Referer");
+        const redirectUrl = referer
+            ? "https://static-res.pages.dev/teleimage/img-block-compressed.png"
+            : `${url.origin}/block-img.html`;
         return Response.redirect(redirectUrl, 302);
     }
 
-    // Check if WhiteList_Mode is enabled
+    // 如果开启了白名单模式，非白名单一律拦截
     if (env.WhiteList_Mode === "true") {
         return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
     }
 
-    // If no metadata or further actions required, moderate content and add to KV if needed
+    // ---------- 内容安全检测 ----------
     if (env.ModerateContentApiKey) {
         try {
             console.log("Starting content moderation...");
@@ -114,26 +146,52 @@ export async function onRequest(context) {
             }
         } catch (error) {
             console.error("Error during content moderation: " + error.message);
-            // Moderation failure should not affect user experience, continue processing
+            // 审核失败不要影响用户体验，继续往下走
         }
     }
-    
- // Only save metadata if content is not adult content
- // Adult content cases are already handled above and will not reach this point
+
+    // ---------- 正常内容：保存 metadata ----------
     console.log("Saving metadata");
     await env.img_url.put(params.id, "", { metadata });
 
- // --- override headers to force inline preview + CF cache ---
-const fileBuffer = await response.arrayBuffer();
+    // ---------- 最后统一包装响应：inline + CF 缓存 ----------
+    const fileBuffer = await response.arrayBuffer();
+    const contentType = response.headers.get("Content-Type") || "image/jpeg";
 
-// 自动识别原始 content-type，如果没有，就设置为通用 image/jpeg
-const contentType = response.headers.get("Content-Type") || "image/jpeg";
+    return new Response(fileBuffer, {
+        headers: {
+            "Content-Type": contentType,                   // 让浏览器正确渲染
+            "Content-Disposition": "inline",              // 不再触发下载
+            "Cache-Control": "public, max-age=31536000",  // 让 Cloudflare 缓存 1 年
+            "Access-Control-Allow-Origin": "*",           // 允许前端跨域引用
+        },
+    });
+}
 
-return new Response(fileBuffer, {
-    headers: {
-        "Content-Type": contentType,                      // 让浏览器正确渲染
-        "Content-Disposition": "inline",                 // 不再触发下载
-        "Cache-Control": "public, max-age=31536000",     // 让 Cloudflare 缓存 1 年
-        "Access-Control-Allow-Origin": "*",              // 允许跨域（前端框架更稳定）
+// 保留原来的 getFilePath 函数（你之前文件里的那段）
+async function getFilePath(env, file_id) {
+    try {
+        const url = `https://api.telegram.org/bot${env.TG_Bot_Token}/getFile?file_id=${file_id}`;
+        const res = await fetch(url, {
+            method: "GET",
+        });
+
+        if (!res.ok) {
+            console.error(`HTTP error! status: ${res.status}`);
+            return null;
+        }
+
+        const responseData = await res.json();
+        const { ok, result } = responseData;
+
+        if (ok && result) {
+            return result.file_path;
+        } else {
+            console.error("Error in response data:", responseData);
+            return null;
+        }
+    } catch (error) {
+        console.error("Error fetching file path:", error.message);
+        return null;
     }
-});
+}
