@@ -117,39 +117,23 @@ export async function onRequest(context) {
             // Moderation failure should not affect user experience, continue processing
         }
     }
-
-    // Only save metadata if content is not adult content
-    // Adult content cases are already handled above and will not reach this point
+    
+ // Only save metadata if content is not adult content
+ // Adult content cases are already handled above and will not reach this point
     console.log("Saving metadata");
     await env.img_url.put(params.id, "", { metadata });
 
-    // Return file content
-    return response;
-}
+ // --- override headers to force inline preview + CF cache ---
+const fileBuffer = await response.arrayBuffer();
 
-async function getFilePath(env, file_id) {
-    try {
-        const url = `https://api.telegram.org/bot${env.TG_Bot_Token}/getFile?file_id=${file_id}`;
-        const res = await fetch(url, {
-            method: 'GET',
-        });
+// 自动识别原始 content-type，如果没有，就设置为通用 image/jpeg
+const contentType = response.headers.get("Content-Type") || "image/jpeg";
 
-        if (!res.ok) {
-            console.error(`HTTP error! status: ${res.status}`);
-            return null;
-        }
-
-        const responseData = await res.json();
-        const { ok, result } = responseData;
-
-        if (ok && result) {
-            return result.file_path;
-        } else {
-            console.error('Error in response data:', responseData);
-            return null;
-        }
-    } catch (error) {
-        console.error('Error fetching file path:', error.message);
-        return null;
+return new Response(fileBuffer, {
+    headers: {
+        "Content-Type": contentType,                      // 让浏览器正确渲染
+        "Content-Disposition": "inline",                 // 不再触发下载
+        "Cache-Control": "public, max-age=31536000",     // 让 Cloudflare 缓存 1 年
+        "Access-Control-Allow-Origin": "*",              // 允许跨域（前端框架更稳定）
     }
-}
+});
